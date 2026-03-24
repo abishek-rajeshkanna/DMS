@@ -1,0 +1,720 @@
+# Implementation Plan: Dealer Management System (DMS)
+
+## Overview
+
+Spring Boot 4 / Java 23 backend with MySQL, Lombok, Spring Security, and Spring Data JPA.
+Implementation follows the layered architecture: Filter Chain → Controller → Service → Repository → MySQL.
+Tasks are ordered so each step builds on the previous; async, cache, and security infrastructure are wired before domain modules.
+
+## Tasks
+
+- [x] 1. Project setup — dependencies, properties, and profiles
+  - [x] 1.1 Add missing dependencies to `pom.xml`
+    - Add `jjwt-api`, `jjwt-impl`, `jjwt-jackson` (0.12.6)
+    - Add `spring-boot-starter-validation`
+    - Add `spring-boot-starter-cache` and `caffeine`
+    - Add `logstash-logback-encoder` (8.0)
+    - Add `jqwik` (1.9.2, test scope)
+    - _Requirements: 2.1, 20.1, 21.4_
+  - [x] 1.2 Expand `src/main/resources/application.properties`
+    - Add JWT secret and expiry properties (`app.jwt.secret`, `app.jwt.access-token-expiry=900`, `app.jwt.refresh-token-expiry=604800`)
+    - Add cache properties (`spring.cache.type=caffeine`, `spring.cache.caffeine.spec`)
+    - Add async thread-pool properties
+    - Add CORS allowed-origins property (`app.cors.allowed-origins`)
+    - Add `spring.profiles.active=dev`
+    - _Requirements: 2.1, 20.1, 22.2_
+  - [x] 1.3 Create `src/main/resources/application-dev.properties`
+    - Set `spring.jpa.show-sql=true`, `logging.level.com.hyundai.DMS=DEBUG`
+    - _Requirements: 21.1_
+  - [x] 1.4 Create `src/main/resources/application-prod.properties`
+    - Set `spring.jpa.show-sql=false`, `server.ssl.enabled=true` (or reverse-proxy note)
+    - _Requirements: 21.4, 23.6_
+
+
+- [x] 2. Database schema — SQL migration
+  - [x] 2.1 Create `src/main/resources/schema.sql` with all 14 table DDL statements
+    - Tables: `dealerships`, `users`, `refresh_tokens`, `inventory`, `inventory_history`, `customers`, `test_drives`, `orders`, `order_items`, `payments`, `service_tickets`, `service_items`, `audit_logs`, `notifications`
+    - Include all indexes listed in the design document per table
+    - Use `CREATE TABLE IF NOT EXISTS` for idempotency
+    - _Requirements: 7.3, 22.3_
+  - [x] 2.2 Set `spring.jpa.hibernate.ddl-auto=validate` and `spring.sql.init.mode=always` in properties
+    - Ensures schema is applied on startup and Hibernate validates against it
+    - _Requirements: 22.3_
+
+
+- [x] 3. Domain enums
+  - [x] 3.1 Create all 17 enums in `com.hyundai.DMS.domain.enums`
+    - `Role` (SUPER_ADMIN, ADMIN, MANAGER, SALESPERSON, TECHNICIAN, RECEPTIONIST)
+    - `UserStatus` (ACTIVE, INACTIVE, SUSPENDED)
+    - `InventoryStatus` (AVAILABLE, RESERVED, TEST_DRIVE, SOLD, INACTIVE)
+    - `InventoryCondition` (NEW, USED, CERTIFIED_PRE_OWNED)
+    - `FuelType` (PETROL, DIESEL, ELECTRIC, HYBRID, CNG)
+    - `Transmission` (MANUAL, AUTOMATIC, CVT, AMT)
+    - `BodyType` (SEDAN, SUV, HATCHBACK, COUPE, CONVERTIBLE, VAN, TRUCK, WAGON)
+    - `CustomerStatus` (LEAD, PROSPECT, CUSTOMER, LOST)
+    - `TestDriveStatus` (SCHEDULED, IN_PROGRESS, COMPLETED, CANCELLED)
+    - `OrderStatus` (DRAFT, CONFIRMED, PROCESSING, DELIVERED, CANCELLED)
+    - `OrderItemType` (VEHICLE, ACCESSORY, INSURANCE, WARRANTY, FEE, OTHER)
+    - `PaymentStatus` (PENDING, COMPLETED, FAILED, REFUNDED)
+    - `PaymentMethod` (CASH, CARD, BANK_TRANSFER, FINANCE, CHEQUE)
+    - `ServiceTicketStatus` (OPEN, IN_PROGRESS, COMPLETED, DELIVERED, CANCELLED)
+    - `ServicePriority` (LOW, MEDIUM, HIGH, URGENT)
+    - `ServiceType` (MAINTENANCE, REPAIR, INSPECTION, RECALL, WARRANTY, OTHER)
+    - `ServiceItemType` (PART, LABOR, CONSUMABLE, EXTERNAL)
+    - _Requirements: 3.1, 7.1, 8.1, 9.1, 10.1, 12.1, 13.1, 14.1_
+
+
+- [x] 4. Domain entities
+  - [x] 4.1 Create `Dealership` entity (`com.hyundai.DMS.domain.entity`)
+    - Fields: id, name, email, phone, address, city, state, licenseNo, isActive, createdAt, updatedAt
+    - Annotations: `@Entity`, `@Table(name="dealerships")`, `@EntityListeners(AuditingEntityListener.class)`, Lombok `@Data`/`@Builder`
+    - _Requirements: 5.1_
+  - [x] 4.2 Create `User` entity
+    - Fields: id, dealership (ManyToOne), firstName, lastName, email, passwordHash, role (enum), status (enum), failedLoginAttempts, lockedUntil, lastLogin, passwordChangedAt, createdAt, updatedAt
+    - _Requirements: 1.2, 6.1_
+  - [x] 4.3 Create `RefreshToken` entity
+    - Fields: id, user (ManyToOne), tokenHash, expiresAt, isRevoked, revokedAt, createdAt
+    - _Requirements: 2.1_
+  - [x] 4.4 Create `Inventory` entity
+    - Fields: id, dealership (ManyToOne), vin, make, model, variant, year, fuelType, transmission, bodyType, color, mileage, conditionType, status, costPrice, sellingPrice, intakeDate, notes, createdAt, updatedAt
+    - _Requirements: 7.1_
+  - [x] 4.5 Create `InventoryHistory` entity
+    - Fields: id, inventory (ManyToOne), fieldName, oldValue, newValue, changedBy (ManyToOne User), reason, createdAt
+    - _Requirements: 7.8, 17.1_
+  - [x] 4.6 Create `Customer` entity
+    - Fields: id, dealership (ManyToOne), firstName, lastName, email, phone, status, source, assignedTo (ManyToOne User), notes, createdAt, updatedAt
+    - _Requirements: 8.1_
+  - [x] 4.7 Create `TestDrive` entity
+    - Fields: id, dealership (ManyToOne), customer (ManyToOne), inventory (ManyToOne), staff (ManyToOne User), scheduledAt, startedAt, endedAt, status, odometerBefore, odometerAfter, notes, createdAt, updatedAt
+    - _Requirements: 9.1_
+  - [x] 4.8 Create `Order` entity
+    - Fields: id, dealership (ManyToOne), orderNumber, customer (ManyToOne), salesperson (ManyToOne User), status, orderDate, subtotal, discountAmount, taxRate, taxAmount, tradeInValue, totalAmount, cancellationReason, notes, createdAt, updatedAt
+    - _Requirements: 10.1_
+  - [x] 4.9 Create `OrderItem` entity
+    - Fields: id, order (ManyToOne), itemType, inventory (ManyToOne nullable), description, unitPrice, quantity, discount, lineTotal, createdAt, updatedAt
+    - _Requirements: 11.1_
+  - [x] 4.10 Create `Payment` entity
+    - Fields: id, order (ManyToOne), amount, method, status, referenceNo, notes, paidAt, createdAt, updatedAt
+    - _Requirements: 12.1_
+  - [x] 4.11 Create `ServiceTicket` entity
+    - Fields: id, dealership (ManyToOne), ticketNumber, customer (ManyToOne), assignedTo (ManyToOne User nullable), vehicleMake, vehicleModel, vehicleYear, vehicleVin, licensePlate, odometerIn, odometerOut, status, priority, serviceType, diagnosis, customerApproval, dropOffAt, promisedAt, completedAt, deliveredAt, totalParts, totalLabor, totalCost, notes, createdAt, updatedAt
+    - _Requirements: 13.1_
+  - [x] 4.12 Create `ServiceItem` entity
+    - Fields: id, ticket (ManyToOne), itemType, description, partNumber, unitCost, quantity, lineTotal, createdAt, updatedAt
+    - _Requirements: 14.1_
+  - [x] 4.13 Create `AuditLog` entity
+    - Fields: id, userId (nullable), dealershipId (nullable), action, tableName, recordId, oldValues (JSON string), newValues (JSON string), ipAddress, userAgent, createdAt
+    - _Requirements: 15.1_
+  - [x] 4.14 Create `Notification` entity
+    - Fields: id, user (ManyToOne), title, message, isRead, readAt, referenceType, referenceId, createdAt
+    - _Requirements: 16.1_
+  - [x] 4.15 Enable JPA Auditing — add `@EnableJpaAuditing` to `DmsApplication` or a config class
+    - _Requirements: 5.1, 6.1_
+
+
+- [x] 5. Repository layer
+  - [x] 5.1 Create `DealershipRepository` extending `JpaRepository<Dealership, Long>` and `JpaSpecificationExecutor<Dealership>`
+    - Custom method: `existsByEmail(String email)`, `existsByLicenseNo(String licenseNo)`
+    - _Requirements: 5.2, 5.4_
+  - [x] 5.2 Create `UserRepository`
+    - Custom methods: `findByEmail(String email)`, `existsByEmail(String email)`
+    - _Requirements: 1.2, 6.3_
+  - [x] 5.3 Create `RefreshTokenRepository`
+    - Custom methods: `findByTokenHash(String hash)`, `findAllByUserIdAndIsRevokedFalse(Long userId)`, `revokeAllByUserId(Long userId)` (JPQL update)
+    - _Requirements: 2.2, 2.4_
+  - [x] 5.4 Create `InventoryRepository` extending `JpaSpecificationExecutor<Inventory>`
+    - Custom method: `existsByVin(String vin)`
+    - _Requirements: 7.2, 7.4_
+  - [x] 5.5 Create `InventoryHistoryRepository`
+    - Custom method: `findAllByInventoryIdOrderByCreatedAtDesc(Long inventoryId, Pageable pageable)`
+    - _Requirements: 17.1_
+  - [x] 5.6 Create `CustomerRepository` extending `JpaSpecificationExecutor<Customer>`
+    - _Requirements: 8.3_
+  - [x] 5.7 Create `TestDriveRepository` extending `JpaSpecificationExecutor<TestDrive>`
+    - _Requirements: 9.6_
+  - [x] 5.8 Create `OrderRepository` extending `JpaSpecificationExecutor<Order>`
+    - Custom method: `findByOrderNumber(String orderNumber)`
+    - _Requirements: 10.7_
+  - [x] 5.9 Create `OrderItemRepository`
+    - Custom method: `findAllByOrderId(Long orderId)`, `sumLineTotalByOrderId(Long orderId)` (JPQL)
+    - _Requirements: 11.3_
+  - [x] 5.10 Create `PaymentRepository` extending `JpaSpecificationExecutor<Payment>`
+    - Custom method: `sumCompletedAmountByOrderId(Long orderId)` (JPQL)
+    - _Requirements: 12.3, 12.6_
+  - [x] 5.11 Create `ServiceTicketRepository` extending `JpaSpecificationExecutor<ServiceTicket>`
+    - _Requirements: 13.6_
+  - [x] 5.12 Create `ServiceItemRepository`
+    - Custom method: `findAllByTicketId(Long ticketId)`
+    - _Requirements: 14.1_
+  - [x] 5.13 Create `AuditLogRepository` extending `JpaSpecificationExecutor<AuditLog>`
+    - _Requirements: 15.2_
+  - [x] 5.14 Create `NotificationRepository`
+    - Custom methods: `findAllByUserIdAndIsRead(Long userId, boolean isRead, Pageable pageable)`, `findByIdAndUserId(Long id, Long userId)`
+    - _Requirements: 16.1, 16.5_
+
+
+- [x] 6. Security infrastructure
+  - [x] 6.1 Create `DmsUserDetails` implementing `UserDetails` (`com.hyundai.DMS.security`)
+    - Carries `userId` (Long), `role` (Role), `dealershipId` (Long) alongside standard UserDetails fields
+    - Helper methods: `isSuperAdmin()`, `isAdmin()`, `getDealershipId()`
+    - _Requirements: 2.5, 3.1_
+  - [x] 6.2 Create `DmsUserDetailsService` implementing `UserDetailsService`
+    - Loads `User` by email via `UserRepository`; wraps in `DmsUserDetails`
+    - Throws `UsernameNotFoundException` if not found
+    - _Requirements: 1.2_
+  - [x] 6.3 Create `JwtService` (`com.hyundai.DMS.security`)
+    - `generateAccessToken(DmsUserDetails)` — signs JWT with HS256, sets `user_id`, `role`, `dealership_id` claims, 15-min expiry
+    - `generateRefreshToken()` — returns random UUID string (raw)
+    - `validateToken(String token)` — throws `JwtException` on invalid/expired
+    - `extractClaims(String token)` — returns `Claims`
+    - Read secret and expiry from `@Value` bound to `app.jwt.*` properties
+    - _Requirements: 1.1, 2.1, 2.5_
+  - [x] 6.4 Create `JwtAuthenticationFilter` extending `OncePerRequestFilter` (`com.hyundai.DMS.filter`)
+    - Extract `Authorization: Bearer <token>` header
+    - Validate token via `JwtService`; set `UsernamePasswordAuthenticationToken` in `SecurityContextHolder`
+    - On missing/invalid token: do not set context (let `AuthenticationEntryPoint` handle it)
+    - _Requirements: 2.6, 23.4_
+  - [x] 6.5 Create `SecurityConfig` (`com.hyundai.DMS.config`)
+    - Disable CSRF, disable session creation (`STATELESS`)
+    - Register `JwtAuthenticationFilter` before `UsernamePasswordAuthenticationFilter`
+    - Configure `AuthenticationEntryPoint` to return HTTP 401 JSON
+    - Configure `AccessDeniedHandler` to return HTTP 403 JSON
+    - Set security headers: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Strict-Transport-Security: max-age=31536000`
+    - Permit `/api/v1/auth/login` and `/api/v1/auth/refresh` without authentication
+    - Enable `@EnableMethodSecurity` for `@PreAuthorize` support
+    - _Requirements: 2.6, 3.1, 23.1, 23.3_
+  - [x] 6.6 Create `CorsConfig` (`com.hyundai.DMS.config`)
+    - Read allowed origins from `app.cors.allowed-origins`
+    - _Requirements: 23.2_
+  - [ ]* 6.7 Write property test for security headers (`SecurityHeadersPropertyTest`)
+    - **Property 47: Security Headers on All Responses**
+    - **Validates: Requirements 23.1**
+
+
+- [x] 7. Cross-cutting concerns
+  - [ ] 7.1 Create `CorrelationIdFilter` (`com.hyundai.DMS.filter`)
+    - Read `X-Correlation-Id` request header or generate UUID
+    - Store in `MDC.put("correlationId", id)`
+    - Add `X-Correlation-Id` to response headers
+    - Clear MDC after response
+    - _Requirements: 21.3_
+  - [ ] 7.2 Create `RequestLoggingFilter` (`com.hyundai.DMS.filter`)
+    - Wrap response with `ContentCachingResponseWrapper`
+    - After response committed: log `INFO method URI status durationMs`
+    - Never log `password`, `password_hash`, or `token` fields
+    - _Requirements: 21.1, 21.5_
+  - [ ] 7.3 Create `AsyncConfig` (`com.hyundai.DMS.config`)
+    - Define `auditExecutor` bean: corePool=2, maxPool=5, queue=500, prefix=`audit-`
+    - Define `notificationExecutor` bean: corePool=2, maxPool=5, queue=500, prefix=`notif-`
+    - Add `TaskDecorator` that copies MDC context to async threads
+    - Annotate class with `@EnableAsync`
+    - _Requirements: 15.6, 22.4_
+  - [ ] 7.4 Create `CacheConfig` (`com.hyundai.DMS.config`)
+    - Configure `CaffeineCacheManager` with named caches: `inventoryList` (TTL 5 min), `dealershipById` (TTL 10 min)
+    - Log cache hit/miss at DEBUG level
+    - Annotate class with `@EnableCaching`
+    - _Requirements: 20.1, 20.4, 20.5, 21.6_
+  - [ ] 7.5 Create `GlobalExceptionHandler` (`com.hyundai.DMS.exception`) annotated with `@RestControllerAdvice`
+    - Handle: `MethodArgumentNotValidException` → 400 with `fieldErrors`
+    - Handle: `ConstraintViolationException` → 400
+    - Handle: `MethodArgumentTypeMismatchException` → 400
+    - Handle: `ResourceNotFoundException` → 404
+    - Handle: `ConflictException` → 409
+    - Handle: `ForbiddenException` → 403
+    - Handle: `AccountLockedException` → 423
+    - Handle: `DataIntegrityViolationException` → 409 (parse constraint name, no raw SQL)
+    - Handle: `AccessDeniedException` → 403
+    - Handle: `AuthenticationException` → 401
+    - Handle: `Exception` (catch-all) → 500, log full stack trace at ERROR
+    - All responses include `status`, `error`, `message`, `timestamp`, `correlationId`
+    - _Requirements: 18.1–18.6_
+  - [ ] 7.6 Create custom exception classes
+    - `ResourceNotFoundException`, `ConflictException`, `ForbiddenException`, `AccountLockedException`, `ValidationException`
+    - _Requirements: 18.2, 18.3_
+  - [ ] 7.7 Create `HtmlSanitizer` utility (`com.hyundai.DMS.util`)
+    - `sanitize(String input)` — strips HTML tags using regex/allowlist
+    - _Requirements: 23.5_
+  - [ ] 7.8 Create `SequenceGenerator` utility (`com.hyundai.DMS.util`)
+    - `nextOrderNumber(LocalDate date)` → `ORD-{YYYYMMDD}-{seq:04d}`
+    - `nextTicketNumber(LocalDate date)` → `SVC-{YYYYMMDD}-{seq:04d}`
+    - Use an `AtomicInteger` per date or a DB sequence table
+    - _Requirements: 10.2, 13.2_
+  - [ ] 7.9 Create `PaginationUtils` utility (`com.hyundai.DMS.util`)
+    - `toPagedResponse(Page<T> page)` → `PagedResponse<T>` with `content`, `page`, `size`, `totalElements`, `totalPages`, `last`
+    - _Requirements: 19.3_
+  - [ ] 7.10 Create `PagedResponse<T>` DTO (`com.hyundai.DMS.dto.response`)
+    - _Requirements: 19.3_
+  - [ ]* 7.11 Write property test for correlation ID propagation (`CorrelationIdFilterPropertyTest`)
+    - **Property 50: Correlation ID Propagation**
+    - **Validates: Requirements 21.3**
+  - [ ]* 7.12 Write property test for bean validation error envelope (`GlobalExceptionHandlerPropertyTest`)
+    - **Property 45: Bean Validation Error Envelope**
+    - **Validates: Requirements 18.1**
+  - [ ]* 7.13 Write property test for DB constraint sanitization (`GlobalExceptionHandlerPropertyTest`)
+    - **Property 46: DB Constraint Violation Sanitization**
+    - **Validates: Requirements 18.3**
+  - [ ]* 7.14 Write property test for HTML sanitization (`HtmlSanitizerPropertyTest`)
+    - **Property 49: HTML Sanitization on String Inputs**
+    - **Validates: Requirements 23.5**
+  - [ ]* 7.15 Write property test for pagination envelope invariant (`PaginationPropertyTest`)
+    - **Property 19: Pagination Envelope Invariant**
+    - **Validates: Requirements 19.1, 19.2, 19.3**
+
+- [x] 8. Checkpoint — compile and verify infrastructure
+  - Ensure all infrastructure classes compile, `DmsApplication` starts, and DB connection succeeds. Ask the user if questions arise.
+
+
+- [x] 9. Auth module
+  - [x] 9.1 Create `TokenService` (`com.hyundai.DMS.service`)
+    - `issueTokenPair(User user)` — generates access + refresh tokens; stores SHA-256 hash of refresh token in `refresh_tokens`
+    - `refreshTokens(String rawRefreshToken)` — validates hash, checks not revoked/expired, rotates tokens
+    - `revokeAllForUser(Long userId)` — sets `is_revoked=1`, `revoked_at=now` for all active tokens
+    - _Requirements: 2.1, 2.2, 2.3, 2.4_
+  - [ ]* 9.2 Write property test for refresh token hash storage (`TokenServicePropertyTest`)
+    - **Property 7: Refresh Token Hash Storage**
+    - **Validates: Requirements 2.1**
+  - [ ]* 9.3 Write property test for token rotation (`TokenServicePropertyTest`)
+    - **Property 8: Refresh Token Rotation**
+    - **Validates: Requirements 2.2**
+  - [ ]* 9.4 Write property test for revoked/expired token rejection (`TokenServicePropertyTest`)
+    - **Property 9: Revoked/Expired Token Rejection**
+    - **Validates: Requirements 2.3**
+  - [x] 9.5 Create `AuthService` (`com.hyundai.DMS.service`)
+    - `login(String email, String password, String ipAddress, String userAgent)` — validates credentials, checks lock/status, increments/resets counter, writes audit log async, returns token pair
+    - `logout(Long userId)` — revokes all tokens via `TokenService`
+    - `changePassword(Long userId, String currentPassword, String newPassword)` — validates current, hashes new, revokes tokens, writes audit log async
+    - _Requirements: 1.1–1.8, 4.1–4.5_
+  - [ ]* 9.6 Write property test for JWT structure invariant (`JwtServicePropertyTest`)
+    - **Property 1: JWT Structure Invariant**
+    - **Validates: Requirements 1.1, 2.5**
+  - [ ]* 9.7 Write property test for expired JWT rejection (`JwtServicePropertyTest`)
+    - **Property 48: Expired JWT Rejection**
+    - **Validates: Requirements 23.4**
+  - [ ]* 9.8 Write property test for failed login counter (`AuthServicePropertyTest`)
+    - **Property 2: Failed Login Increments Counter**
+    - **Validates: Requirements 1.4**
+  - [ ]* 9.9 Write property test for successful login reset (`AuthServicePropertyTest`)
+    - **Property 3: Successful Login Resets Counter**
+    - **Validates: Requirements 1.6**
+  - [ ]* 9.10 Write property test for locked account rejection (`AuthServicePropertyTest`)
+    - **Property 4: Locked Account Rejection**
+    - **Validates: Requirements 1.3**
+  - [ ]* 9.11 Write property test for inactive/suspended account rejection (`AuthServicePropertyTest`)
+    - **Property 5: Inactive/Suspended Account Rejection**
+    - **Validates: Requirements 1.8**
+  - [ ]* 9.12 Write property test for logout revokes all tokens (`AuthServicePropertyTest`)
+    - **Property 10: Logout Revokes All Tokens**
+    - **Validates: Requirements 2.4**
+  - [ ]* 9.13 Write property test for password change revokes tokens (`AuthServicePropertyTest`)
+    - **Property 15: Password Change Revokes Tokens**
+    - **Validates: Requirements 4.3**
+  - [ ]* 9.14 Write property test for password complexity rejection (`PasswordValidationPropertyTest`)
+    - **Property 14: Password Complexity Rejection**
+    - **Validates: Requirements 4.5**
+  - [x] 9.15 Create `AuthController` (`com.hyundai.DMS.controller`)
+    - `POST /api/v1/auth/login` — public
+    - `POST /api/v1/auth/refresh` — public
+    - `POST /api/v1/auth/logout` — authenticated
+    - `PUT /api/v1/auth/password` — authenticated
+    - _Requirements: 1.1, 2.2, 2.4, 4.1_
+  - [x] 9.16 Create auth DTOs
+    - `LoginRequest` (email, password — `@Valid` constraints)
+    - `RefreshRequest` (refreshToken)
+    - `ChangePasswordRequest` (currentPassword, newPassword — complexity validation)
+    - `AuthResponse` (accessToken, refreshToken, expiresIn, tokenType)
+    - _Requirements: 1.1, 4.5_
+
+
+- [x] 10. Dealership module
+  - [x] 10.1 Create `DealershipSpecification` implementing `Specification<Dealership>`
+    - Predicates for: `name` (LIKE), `city`, `state`, `isActive`
+    - _Requirements: 5.4_
+  - [x] 10.2 Create `DealershipService` (`com.hyundai.DMS.service`)
+    - `createDealership(DealershipRequest, DmsUserDetails)` — `@PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN')")`, check duplicate email/licenseNo, sanitize strings, write audit log async
+    - `getDealership(Long id)` — `@Cacheable("dealershipById")`
+    - `listDealerships(DealershipFilter, Pageable)` — paginated with Specification
+    - `updateDealership(Long id, DealershipRequest, DmsUserDetails)` — `@CacheEvict("dealershipById")`, write audit log async
+    - `deleteDealership(Long id, DmsUserDetails)` — soft-delete (`isActive=false`), write audit log async
+    - _Requirements: 5.1–5.6, 20.4_
+  - [ ]* 10.3 Write property test for duplicate dealership rejection (`DealershipServicePropertyTest`)
+    - **Property 16: Duplicate Dealership Rejection**
+    - **Validates: Requirements 5.2**
+  - [ ]* 10.4 Write property test for dealership field validation (`DealershipServicePropertyTest`)
+    - **Property 17: Dealership Field Validation**
+    - **Validates: Requirements 5.3**
+  - [x] 10.5 Create `DealershipController`
+    - `GET /api/v1/dealerships`, `POST /api/v1/dealerships`, `GET /api/v1/dealerships/{id}`, `PUT /api/v1/dealerships/{id}`, `DELETE /api/v1/dealerships/{id}`
+    - _Requirements: 5.1_
+  - [x] 10.6 Create dealership DTOs
+    - `DealershipRequest` (name, email, phone, address, city, state, licenseNo — `@Valid`)
+    - `DealershipResponse` (all fields except sensitive)
+    - `DealershipFilter` (name, city, state, isActive)
+    - _Requirements: 5.3_
+
+
+- [x] 11. User module
+  - [x] 11.1 Create `UserSpecification` implementing `Specification<User>`
+    - Predicates for: `dealershipId`, `role`, `status`, `search` (firstName/lastName/email LIKE)
+    - _Requirements: 6.4_
+  - [x] 11.2 Create `UserService`
+    - `createUser(UserRequest, DmsUserDetails)` — `@PreAuthorize("hasAnyRole('SUPER_ADMIN','ADMIN','MANAGER')")`, hash password BCrypt cost≥12, check duplicate email, sanitize, write audit log async
+    - `listUsers(UserFilter, Pageable, DmsUserDetails)` — enforce dealership scope for MANAGER
+    - `getUser(Long id, DmsUserDetails)` — enforce dealership scope
+    - `updateUser(Long id, UserRequest, DmsUserDetails)` — sanitize, write audit log async
+    - `changeStatus(Long id, UserStatus, DmsUserDetails)` — if SUSPENDED revoke tokens, write audit log async
+    - Never include `passwordHash` or `failedLoginAttempts` in response
+    - _Requirements: 6.1–6.8_
+  - [ ]* 11.3 Write property test for password hash not exposed (`UserResponsePropertyTest`)
+    - **Property 20: Password Hash Never Exposed**
+    - **Validates: Requirements 6.6**
+  - [ ]* 11.4 Write property test for suspension revokes tokens (`UserServicePropertyTest`)
+    - **Property 21: Suspension Revokes Tokens**
+    - **Validates: Requirements 6.7**
+  - [x] 11.5 Create `UserController`
+    - `GET /api/v1/users`, `POST /api/v1/users`, `GET /api/v1/users/{id}`, `PUT /api/v1/users/{id}`, `PATCH /api/v1/users/{id}/status`
+    - _Requirements: 6.1_
+  - [x] 11.6 Create user DTOs
+    - `UserRequest` (firstName, lastName, email, password, role, dealershipId — `@Valid`)
+    - `UserResponse` (all fields except passwordHash, failedLoginAttempts)
+    - `UserStatusRequest` (status)
+    - `UserFilter` (dealershipId, role, status, search)
+    - _Requirements: 6.6_
+
+
+- [x] 12. Inventory module
+  - [x] 12.1 Create `InventorySpecification` implementing `Specification<Inventory>`
+    - Predicates for: `dealershipId`, `make`, `model`, `year`, `fuelType`, `transmission`, `bodyType`, `conditionType`, `status`, `minPrice`/`maxPrice` (sellingPrice range), `search` (make/model/variant LIKE)
+    - _Requirements: 7.4, 7.5_
+  - [x] 12.2 Create `InventoryService`
+    - `createInventory(InventoryRequest, DmsUserDetails)` — check duplicate VIN, validate price>0 and year range, sanitize, write `inventory_history` for all initial fields, evict cache, write audit log async
+    - `listInventory(InventoryFilter, Pageable)` — `@Cacheable("inventoryList")`, add `Cache-Control: max-age=300, public` header
+    - `getInventory(Long id, DmsUserDetails)` — enforce dealership scope
+    - `updateInventory(Long id, InventoryRequest, DmsUserDetails)` — diff fields, write `inventory_history` per changed field, `@CacheEvict("inventoryList")`, write audit log async
+    - `deleteInventory(Long id, DmsUserDetails)` — `@PreAuthorize("hasAnyRole('ADMIN','MANAGER','SUPER_ADMIN')")`, `@CacheEvict("inventoryList")`
+    - `getInventoryHistory(Long id, Pageable, DmsUserDetails)` — `@PreAuthorize("hasAnyRole('MANAGER','ADMIN','SUPER_ADMIN')")`
+    - Enforce sold-status lock: only ADMIN/MANAGER can change status of sold inventory
+    - _Requirements: 7.1–7.10, 17.1–17.3, 20.1–20.3_
+  - [ ]* 12.3 Write property test for duplicate VIN rejection (`InventoryServicePropertyTest`)
+    - **Property 22: Duplicate VIN Rejection**
+    - **Validates: Requirements 7.2**
+  - [ ]* 12.4 Write property test for inventory field validation (`InventoryServicePropertyTest`)
+    - **Property 23: Inventory Field Validation**
+    - **Validates: Requirements 7.3**
+  - [ ]* 12.5 Write property test for inventory history written on update (`InventoryServicePropertyTest`)
+    - **Property 24: Inventory History Written on Field Update**
+    - **Validates: Requirements 7.8**
+  - [ ]* 12.6 Write property test for sold inventory status lock (`InventoryServicePropertyTest`)
+    - **Property 25: Sold Inventory Status Lock**
+    - **Validates: Requirements 7.9**
+  - [ ]* 12.7 Write property test for cache eviction on inventory write (`InventoryCachePropertyTest`)
+    - **Property 26: Cache Eviction on Inventory Write**
+    - **Validates: Requirements 7.10, 20.2**
+  - [x] 12.8 Create `InventoryController`
+    - `GET /api/v1/inventory`, `POST /api/v1/inventory`, `GET /api/v1/inventory/{id}`, `PUT /api/v1/inventory/{id}`, `DELETE /api/v1/inventory/{id}`, `GET /api/v1/inventory/{id}/history`
+    - _Requirements: 7.1, 17.1_
+  - [x] 12.9 Create inventory DTOs
+    - `InventoryRequest` (all fields with `@Valid` constraints)
+    - `InventoryResponse`
+    - `InventoryHistoryResponse`
+    - `InventoryFilter` (all filter fields)
+    - _Requirements: 7.3_
+
+
+- [x] 13. Customer module
+  - [x] 13.1 Create `CustomerSpecification` implementing `Specification<Customer>`
+    - Predicates for: `dealershipId`, `status`, `source`, `assignedTo`, `search` (firstName/lastName/email/phone LIKE)
+    - _Requirements: 8.3, 8.4_
+  - [x] 13.2 Create `CustomerService`
+    - `createCustomer(CustomerRequest, DmsUserDetails)` — validate phone pattern, sanitize, write audit log async
+    - `listCustomers(CustomerFilter, Pageable, DmsUserDetails)` — for SALESPERSON filter to own + unassigned customers
+    - `getCustomer(Long id, DmsUserDetails)` — enforce dealership scope
+    - `updateCustomer(Long id, CustomerRequest, DmsUserDetails)` — sanitize, write audit log async
+    - `deleteCustomer(Long id, DmsUserDetails)` — `@PreAuthorize("hasAnyRole('MANAGER','ADMIN','SUPER_ADMIN')")`, write audit log async
+    - _Requirements: 8.1–8.8_
+  - [ ]* 13.3 Write property test for salesperson customer visibility (`CustomerServicePropertyTest`)
+    - **Property 27: Salesperson Customer Visibility**
+    - **Validates: Requirements 8.7**
+  - [x] 13.4 Create `CustomerController`
+    - `GET /api/v1/customers`, `POST /api/v1/customers`, `GET /api/v1/customers/{id}`, `PUT /api/v1/customers/{id}`, `DELETE /api/v1/customers/{id}`
+    - _Requirements: 8.1_
+  - [x] 13.5 Create customer DTOs
+    - `CustomerRequest`, `CustomerResponse`, `CustomerFilter`
+    - _Requirements: 8.2_
+
+
+- [x] 14. Test Drive module
+  - [x] 14.1 Create `TestDriveSpecification` implementing `Specification<TestDrive>`
+    - Predicates for: `status`, `customerId`, `inventoryId`, `staffId`, `scheduledAt` range
+    - _Requirements: 9.6_
+  - [x] 14.2 Create `TestDriveService`
+    - `scheduleTestDrive(TestDriveRequest, DmsUserDetails)` — validate inventory status is `available` or `test_drive`, set inventory status to `test_drive`, send notification async to staff
+    - `updateTestDrive(Long id, TestDriveRequest, DmsUserDetails)` — on `completed` validate `odometerAfter >= odometerBefore` and restore inventory to `available`; on `cancelled` restore inventory to `available`; send notification async
+    - `cancelTestDrive(Long id, DmsUserDetails)` — set status `cancelled`, restore inventory
+    - `listTestDrives(TestDriveFilter, Pageable, DmsUserDetails)` — enforce dealership scope
+    - `getTestDrive(Long id, DmsUserDetails)`
+    - _Requirements: 9.1–9.8_
+  - [ ]* 14.3 Write property test for test drive inventory status round trip (`TestDriveServicePropertyTest`)
+    - **Property 28: Test Drive Inventory Status Transitions (Round Trip)**
+    - **Validates: Requirements 9.2, 9.3, 9.4**
+  - [ ]* 14.4 Write property test for odometer constraint (`TestDriveServicePropertyTest`)
+    - **Property 29: Odometer Constraint**
+    - **Validates: Requirements 9.5**
+  - [x] 14.5 Create `TestDriveController`
+    - `GET /api/v1/test-drives`, `POST /api/v1/test-drives`, `GET /api/v1/test-drives/{id}`, `PUT /api/v1/test-drives/{id}`, `PATCH /api/v1/test-drives/{id}/cancel`
+    - _Requirements: 9.1_
+  - [x] 14.6 Create test drive DTOs
+    - `TestDriveRequest`, `TestDriveResponse`, `TestDriveFilter`
+    - _Requirements: 9.5_
+
+
+- [x] 15. Order module
+  - [x] 15.1 Create `OrderSpecification` implementing `Specification<Order>`
+    - Predicates for: `status`, `customerId`, `salespersonId`, `dealershipId`, `orderDate` range
+    - _Requirements: 10.7_
+  - [x] 15.2 Create `OrderService`
+    - `createOrder(OrderRequest, DmsUserDetails)` — generate `orderNumber` via `SequenceGenerator`, compute `taxAmount` and `totalAmount`, write audit log async
+    - `listOrders(OrderFilter, Pageable, DmsUserDetails)` — enforce dealership scope
+    - `getOrder(Long id, DmsUserDetails)`
+    - `updateOrder(Long id, OrderRequest, DmsUserDetails)` — recompute financials, write audit log async
+    - `transitionStatus(Long id, OrderStatus, String cancellationReason, DmsUserDetails)` — on `confirmed` set linked vehicle inventory to `reserved`; on `delivered` set to `sold`; on `cancelled` set to `available` and require `cancellationReason`; write audit log async
+    - _Requirements: 10.1–10.10_
+  - [ ]* 15.3 Write property test for order number format (`OrderServicePropertyTest`)
+    - **Property 30: Order Number Format**
+    - **Validates: Requirements 10.2**
+  - [ ]* 15.4 Write property test for order financial computation (`OrderServicePropertyTest`)
+    - **Property 31: Order Financial Computation**
+    - **Validates: Requirements 10.3**
+  - [ ]* 15.5 Write property test for order-inventory status synchronization (`OrderServicePropertyTest`)
+    - **Property 32: Order-Inventory Status Synchronization**
+    - **Validates: Requirements 10.4, 10.5, 10.6**
+  - [x] 15.6 Create `OrderController`
+    - `GET /api/v1/orders`, `POST /api/v1/orders`, `GET /api/v1/orders/{id}`, `PUT /api/v1/orders/{id}`, `PATCH /api/v1/orders/{id}/status`
+    - _Requirements: 10.1_
+  - [x] 15.7 Create order DTOs
+    - `OrderRequest`, `OrderResponse`, `OrderStatusRequest` (status, cancellationReason), `OrderFilter`
+    - _Requirements: 10.3_
+
+
+- [x] 16. Order Item module
+  - [x] 16.1 Create `OrderItemService`
+    - `addItem(Long orderId, OrderItemRequest, DmsUserDetails)` — reject if order not `draft` (HTTP 409), validate vehicle inventory belongs to same dealership, compute `lineTotal = (unitPrice * quantity) - discount`, recompute order subtotal/tax/total
+    - `updateItem(Long orderId, Long itemId, OrderItemRequest, DmsUserDetails)` — reject if order not `draft`, recompute totals
+    - `removeItem(Long orderId, Long itemId, DmsUserDetails)` — reject if order not `draft`, recompute totals
+    - `listItems(Long orderId, DmsUserDetails)` — enforce dealership scope
+    - _Requirements: 11.1–11.5_
+  - [ ]* 16.2 Write property test for order item line total computation (`OrderItemServicePropertyTest`)
+    - **Property 33: Order Item Line Total Computation**
+    - **Validates: Requirements 11.2**
+  - [ ]* 16.3 Write property test for order totals recomputed on item change (`OrderItemServicePropertyTest`)
+    - **Property 34: Order Totals Recomputed on Item Change**
+    - **Validates: Requirements 11.3**
+  - [ ]* 16.4 Write property test for item modification locked on non-draft (`OrderItemServicePropertyTest`)
+    - **Property 35: Order Item Modification Locked on Non-Draft**
+    - **Validates: Requirements 11.5**
+  - [x] 16.5 Create `OrderItemController`
+    - `GET /api/v1/orders/{orderId}/items`, `POST /api/v1/orders/{orderId}/items`, `PUT /api/v1/orders/{orderId}/items/{itemId}`, `DELETE /api/v1/orders/{orderId}/items/{itemId}`
+    - _Requirements: 11.1_
+  - [x] 16.6 Create order item DTOs
+    - `OrderItemRequest` (itemType, inventoryId, description, unitPrice, quantity, discount — `@Valid`)
+    - `OrderItemResponse`
+    - _Requirements: 11.2_
+
+
+- [x] 17. Payment module
+  - [x] 17.1 Create `PaymentSpecification` implementing `Specification<Payment>`
+    - Predicates for: `orderId`, `status`, `method`
+    - _Requirements: 12.3_
+  - [x] 17.2 Create `PaymentService`
+    - `recordPayment(PaymentRequest, DmsUserDetails)` — `@PreAuthorize("hasAnyRole('MANAGER','ADMIN','SUPER_ADMIN')")`, validate `amount > 0`, write audit log async on `completed` status
+    - `listPayments(PaymentFilter, Pageable, DmsUserDetails)` — enforce dealership scope via order
+    - `getPayment(Long id, DmsUserDetails)`
+    - `updatePayment(Long id, PaymentRequest, DmsUserDetails)` — on status change to `completed`: write audit log async, check if sum of completed payments >= order total and update order to `processing` if currently `confirmed`
+    - _Requirements: 12.1–12.6_
+  - [ ]* 17.3 Write property test for payment amount validation (`PaymentServicePropertyTest`)
+    - **Property 36: Payment Amount Validation**
+    - **Validates: Requirements 12.2**
+  - [ ]* 17.4 Write property test for order auto-processing on full payment (`PaymentServicePropertyTest`)
+    - **Property 37: Order Auto-Processing on Full Payment**
+    - **Validates: Requirements 12.6**
+  - [x] 17.5 Create `PaymentController`
+    - `GET /api/v1/payments`, `POST /api/v1/payments`, `GET /api/v1/payments/{id}`, `PUT /api/v1/payments/{id}`
+    - _Requirements: 12.1_
+  - [x] 17.6 Create payment DTOs
+    - `PaymentRequest` (orderId, amount, method, status, referenceNo, notes — `@Valid`)
+    - `PaymentResponse`
+    - `PaymentFilter`
+    - _Requirements: 12.2_
+
+
+- [x] 18. Service Ticket module
+  - [x] 18.1 Create `ServiceTicketSpecification` implementing `Specification<ServiceTicket>`
+    - Predicates for: `status`, `priority`, `serviceType`, `assignedTo`, `customerId`, `dealershipId`
+    - _Requirements: 13.6_
+  - [x] 18.2 Create `ServiceTicketService`
+    - `createTicket(ServiceTicketRequest, DmsUserDetails)` — generate `ticketNumber` via `SequenceGenerator`, sanitize, send notification async to assigned technician, write audit log async
+    - `listTickets(ServiceTicketFilter, Pageable, DmsUserDetails)` — enforce dealership scope
+    - `getTicket(Long id, DmsUserDetails)`
+    - `updateTicket(Long id, ServiceTicketRequest, DmsUserDetails)` — sanitize, write audit log async
+    - `transitionStatus(Long id, ServiceTicketStatus, DmsUserDetails)` — guard: `in_progress` requires non-empty `diagnosis`; `completed` requires `completedAt` and `customerApproval=1`; `delivered` requires `deliveredAt` and `odometerOut >= odometerIn`; send notification async; write audit log async
+    - `cancelTicket(Long id, DmsUserDetails)` — write audit log async
+    - _Requirements: 13.1–13.10_
+  - [ ]* 18.3 Write property test for service ticket number format (`ServiceTicketServicePropertyTest`)
+    - **Property 38: Service Ticket Number Format**
+    - **Validates: Requirements 13.2**
+  - [ ]* 18.4 Write property test for service ticket status transition guards (`ServiceTicketServicePropertyTest`)
+    - **Property 39: Service Ticket Status Transition Guards**
+    - **Validates: Requirements 13.3, 13.4, 13.5**
+  - [x] 18.5 Create `ServiceTicketController`
+    - `GET /api/v1/service-tickets`, `POST /api/v1/service-tickets`, `GET /api/v1/service-tickets/{id}`, `PUT /api/v1/service-tickets/{id}`, `PATCH /api/v1/service-tickets/{id}/status`
+    - _Requirements: 13.1_
+  - [x] 18.6 Create service ticket DTOs
+    - `ServiceTicketRequest`, `ServiceTicketResponse`, `ServiceTicketStatusRequest`, `ServiceTicketFilter`
+    - _Requirements: 13.3_
+
+
+- [x] 19. Service Item module
+  - [x] 19.1 Create `ServiceItemService`
+    - `addItem(Long ticketId, ServiceItemRequest, DmsUserDetails)` — reject if ticket status is `completed`, `cancelled`, or `delivered` (HTTP 409), compute `lineTotal = unitCost * quantity`, recompute ticket `totalParts`, `totalLabor`, `totalCost`
+    - `updateItem(Long ticketId, Long itemId, ServiceItemRequest, DmsUserDetails)` — reject on terminal status, recompute totals
+    - `removeItem(Long ticketId, Long itemId, DmsUserDetails)` — reject on terminal status, recompute totals
+    - `listItems(Long ticketId, DmsUserDetails)`
+    - _Requirements: 14.1–14.4_
+  - [ ]* 19.2 Write property test for service item line total computation (`ServiceItemServicePropertyTest`)
+    - **Property 40: Service Item Line Total Computation**
+    - **Validates: Requirements 14.2**
+  - [ ]* 19.3 Write property test for ticket totals recomputed on item change (`ServiceItemServicePropertyTest`)
+    - **Property 41: Service Ticket Totals Recomputed on Item Change**
+    - **Validates: Requirements 14.3**
+  - [ ]* 19.4 Write property test for service item locked on terminal status (`ServiceItemServicePropertyTest`)
+    - **Property 42: Service Item Modification Locked on Terminal Status**
+    - **Validates: Requirements 14.4**
+  - [x] 19.5 Create `ServiceItemController`
+    - `GET /api/v1/service-tickets/{ticketId}/items`, `POST /api/v1/service-tickets/{ticketId}/items`, `PUT /api/v1/service-tickets/{ticketId}/items/{itemId}`, `DELETE /api/v1/service-tickets/{ticketId}/items/{itemId}`
+    - _Requirements: 14.1_
+  - [x] 19.6 Create service item DTOs
+    - `ServiceItemRequest` (itemType, description, partNumber, unitCost, quantity — `@Valid`)
+    - `ServiceItemResponse`
+    - _Requirements: 14.2_
+
+
+- [-] 20. Audit Log module
+  - [x] 20.1 Create `AuditService` annotated with `@Async("auditExecutor")`
+    - `log(Long userId, Long dealershipId, String action, String tableName, Long recordId, String oldValues, String newValues, String ipAddress, String userAgent)` — persists `AuditLog` entity; MDC correlation ID propagated via `TaskDecorator`
+    - _Requirements: 15.6, 22.4_
+  - [ ]* 20.2 Write property test for async audit writes are non-blocking (`AuditServicePropertyTest`)
+    - **Property 51: Async Audit Writes Are Non-Blocking**
+    - **Validates: Requirements 15.6, 22.4**
+  - [ ]* 20.3 Write property test for audit log written on every login attempt (`AuditServicePropertyTest`)
+    - **Property 6: Audit Log Written on Every Login Attempt**
+    - **Validates: Requirements 1.7**
+  - [x] 20.4 Create `AuditLogSpecification` implementing `Specification<AuditLog>`
+    - Predicates for: `userId`, `dealershipId`, `action`, `tableName`, `recordId`, `createdAt` range
+    - _Requirements: 15.2_
+  - [x] 20.5 Create `AuditLogService`
+    - `queryLogs(AuditLogFilter, Pageable, DmsUserDetails)` — `@PreAuthorize("hasAnyRole('ADMIN','SUPER_ADMIN')")`, default sort `createdAt DESC`
+    - _Requirements: 15.1–15.5_
+  - [x] 20.6 Create `AuditLogController`
+    - `GET /api/v1/audit-logs`
+    - _Requirements: 15.1_
+  - [x] 20.7 Create audit log DTOs
+    - `AuditLogResponse`, `AuditLogFilter`
+    - _Requirements: 15.2_
+
+
+- [x] 21. Notification module
+  - [x] 21.1 Create `NotificationService` annotated with `@Async("notificationExecutor")`
+    - `send(Long recipientUserId, String title, String message, String referenceType, Long referenceId)` — persists `Notification` entity
+    - `listNotifications(Long userId, Boolean isRead, Pageable)` — returns only caller's notifications
+    - `markAsRead(Long id, Long userId)` — set `isRead=true`, `readAt=now`; throw 404 if not found or not owned
+    - `deleteNotification(Long id, Long userId)` — throw 403/404 if not owned
+    - _Requirements: 16.1–16.5_
+  - [ ]* 21.2 Write property test for notification ownership enforcement (`NotificationServicePropertyTest`)
+    - **Property 43: Notification Ownership Enforcement**
+    - **Validates: Requirements 16.5**
+  - [ ]* 21.3 Write property test for mark-as-read round trip (`NotificationServicePropertyTest`)
+    - **Property 44: Mark-as-Read Round Trip**
+    - **Validates: Requirements 16.4**
+  - [x] 21.4 Create `NotificationController`
+    - `GET /api/v1/notifications`, `PATCH /api/v1/notifications/{id}/read`, `DELETE /api/v1/notifications/{id}`
+    - _Requirements: 16.1_
+  - [x] 21.5 Create notification DTOs
+    - `NotificationResponse`
+    - _Requirements: 16.4_
+
+
+- [x] 22. Checkpoint — end-to-end domain modules
+  - Ensure all modules compile, all `@PreAuthorize` annotations are in place, and the application starts cleanly. Ask the user if questions arise.
+
+- [ ] 23. RBAC cross-cutting property tests
+  - [ ]* 23.1 Write property test for cross-dealership access denied (`RbacPropertyTest`)
+    - **Property 11: Cross-Dealership Access Denied**
+    - **Validates: Requirements 3.2, 3.3**
+  - [ ]* 23.2 Write property test for role-gated write operations (`RbacPropertyTest`)
+    - **Property 12: Role-Gated Write Operations**
+    - **Validates: Requirements 3.4, 3.5**
+  - [ ]* 23.3 Write property test for audit log access restricted (`RbacPropertyTest`)
+    - **Property 13: Audit Log Access Restricted**
+    - **Validates: Requirements 3.7**
+
+- [ ] 24. Filter and sort cross-cutting property tests
+  - [ ]* 24.1 Write property test for filter results match criteria (`FilterPropertyTest`)
+    - **Property 18: Filter Results Match Criteria**
+    - **Validates: Requirements 5.4, 6.4, 7.4, 8.3, 9.6, 10.7, 12.3, 13.6, 15.2, 16.2, 19.5**
+
+
+- [ ] 25. Unit and integration tests
+  - [ ]* 25.1 Write `@WebMvcTest` controller tests for `AuthController`
+    - Test login success/failure HTTP status codes, response body shape, validation rejection
+    - _Requirements: 1.1, 1.3, 1.8, 4.5_
+  - [ ]* 25.2 Write `@WebMvcTest` controller tests for `DealershipController`
+    - Test CRUD endpoints, 409 on duplicate, 403 on wrong role
+    - _Requirements: 5.1–5.3_
+  - [ ]* 25.3 Write `@WebMvcTest` controller tests for `InventoryController`
+    - Test list with filters, cache-control header, history endpoint role guard
+    - _Requirements: 7.1, 7.7, 17.3_
+  - [ ]* 25.4 Write `@WebMvcTest` controller tests for `OrderController` and `OrderItemController`
+    - Test status transitions, item modification lock, financial recomputation
+    - _Requirements: 10.3–10.6, 11.2–11.5_
+  - [ ]* 25.5 Write `@WebMvcTest` controller tests for `ServiceTicketController` and `ServiceItemController`
+    - Test status guards, item lock on terminal status, totals recomputation
+    - _Requirements: 13.3–13.5, 14.3–14.4_
+  - [ ]* 25.6 Write `@DataJpaTest` repository tests
+    - Test `RefreshTokenRepository` revoke queries, `PaymentRepository` sum query, `InventoryHistoryRepository` ordering
+    - _Requirements: 2.4, 12.6, 17.2_
+  - [ ]* 25.7 Write `JwtService` unit tests
+    - Test token generation claims, expiry, invalid signature rejection
+    - _Requirements: 1.1, 2.5, 23.4_
+  - [ ]* 25.8 Write `GlobalExceptionHandler` unit tests
+    - Test each exception type maps to correct HTTP status and envelope shape
+    - _Requirements: 18.1–18.6_
+  - [ ]* 25.9 Write `HtmlSanitizer` unit tests
+    - Test stripping of `<script>`, `<img>`, `<a>` tags; safe strings pass through unchanged
+    - _Requirements: 23.5_
+  - [ ]* 25.10 Write `SequenceGenerator` unit tests
+    - Test `ORD-` and `SVC-` format, sequential numbering, date rollover
+    - _Requirements: 10.2, 13.2_
+
+
+- [x] 26. Logback configuration
+  - [x] 26.1 Create `src/main/resources/logback-spring.xml`
+    - Default (dev) profile: pattern-based console appender with `correlationId` in pattern
+    - `prod` profile: JSON console appender using `LogstashEncoder`
+    - Add `MaskingPatternLayout` or `MaskingJsonGeneratorDecorator` to redact `password`, `password_hash`, `token`, `tokenHash` fields with `[REDACTED]`
+    - _Requirements: 21.4, 21.5_
+  - [x] 26.2 Verify DEBUG-level cache hit/miss logging is wired in `CacheConfig`
+    - Confirm `CacheEventListener` or equivalent logs at DEBUG
+    - _Requirements: 21.6_
+
+- [x] 27. Final checkpoint — full test suite
+  - Run `./mvnw test` and ensure all non-optional tests pass. Verify application starts on both `dev` and `prod` profiles. Ask the user if questions arise.
+
+---
+
+## Notes
+
+- Tasks marked with `*` are optional and can be skipped for a faster MVP build.
+- Each task references specific requirements for traceability.
+- Property tests use jqwik with `@Property(tries = 100)` and include the comment `// Feature: dealer-management-system, Property N: <text>`.
+- All service methods sanitize string inputs via `HtmlSanitizer.sanitize()` before persistence.
+- Audit log and notification writes are always dispatched via `@Async` — never block the request thread.
+- The `DmsUserDetails` principal is injected into service methods via `@AuthenticationPrincipal` in controllers.
